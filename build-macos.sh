@@ -25,8 +25,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleDisplayName</key><string>Local Update Bridge</string>
 <key>CFBundleIconFile</key><string>LUBIcon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.6.9.7</string>
-<key>CFBundleVersion</key><string>1697</string>
+<key>CFBundleShortVersionString</key><string>1.6.9.12</string>
+<key>CFBundleVersion</key><string>16912</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>

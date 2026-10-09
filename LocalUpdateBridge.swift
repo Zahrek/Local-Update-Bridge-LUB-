@@ -37,6 +37,31 @@ struct Project: Identifiable, Hashable {
 private extension Double {
     var roundedToTwoPlaces: Double { (self * 100).rounded() / 100 }
 }
+// BEGIN TESTABLE VERSION POLICY
+// A discovered ZIP is not proof that its code is newer than the installed project.
+// Only an actual installed baseline can justify "New Version Available".
+struct LUBVersionPolicy {
+    enum Result: Equatable { case newer, current, old, available, modified }
+
+    static func compare(_ a: String, _ b: String) -> ComparisonResult {
+        a.compare(b, options: [.numeric, .caseInsensitive])
+    }
+
+    static func decide(package: String, installed: String?, knownVersions: [String],
+                       matchesActiveReceipt: Bool, activeFilesChanged: Bool = false) -> Result {
+        let knownNewer = knownVersions.contains { compare(package, $0) == .orderedAscending }
+        if matchesActiveReceipt { return activeFilesChanged ? .modified : .current }
+        if knownNewer { return .old }
+        guard let installed else { return .available }
+        switch compare(package, installed) {
+        case .orderedAscending: return .old
+        case .orderedDescending: return .newer
+        case .orderedSame: return .available // matching filename != proof of an applied update
+        }
+    }
+}
+// END TESTABLE VERSION POLICY
+
 @MainActor final class Bridge: ObservableObject {
     @Published var projects: [Project] = []
     @Published var candidates: [Candidate] = []
@@ -48,7 +73,8 @@ private extension Double {
     @Published var scheme = ""
     @Published var buildAfterInstall = true
     @Published var showLegacy = false
-    @Published var latestOnly = true
+    // History is visible by default. Users may explicitly hide older releases.
+    @Published var latestOnly = false
     @Published var updateSort: UpdateSort = .newest
     @Published var textScale: Double = min(1.8, max(0.75, UserDefaults.standard.double(forKey: "lub.textScale") == 0 ? 1 : UserDefaults.standard.double(forKey: "lub.textScale"))) {
         didSet { UserDefaults.standard.set(textScale, forKey: "lub.textScale") }
@@ -68,10 +94,23 @@ private extension Double {
     @Published var projectRootOverride = UserDefaults.standard.string(forKey: "lub.projectRoot") ?? ""
     @Published var destinationOverrides: [String: String] = UserDefaults.standard.dictionary(forKey: "lub.projectDestinations") as? [String: String] ?? [:]
     @Published var installedKeys: Set<String> = []
+    // Completed install records in newest-first order, scoped to an exact project destination.
+    private struct AppliedReceipt {
+        let version: String
+        let backup: URL
+        let created: Date
+    }
+    private var receiptHistory: [String: [AppliedReceipt]] = [:]
+    @Published var highestObservedVersions: [String: String] = UserDefaults.standard.dictionary(forKey: "lub.highestObservedVersions") as? [String: String] ?? [:]
+
     @Published var autoScan = UserDefaults.standard.object(forKey: "lub.autoScan") as? Bool ?? true {
         didSet { UserDefaults.standard.set(autoScan, forKey: "lub.autoScan") }
     }
     @Published var extraScanFolders: [String] = UserDefaults.standard.stringArray(forKey: "lub.scanFolders") ?? []
+    @Published var scanCodexPreviews = UserDefaults.standard.bool(forKey: "lub.scanCodexPreviews") {
+        didSet { UserDefaults.standard.set(scanCodexPreviews, forKey: "lub.scanCodexPreviews"); refresh() }
+    }
+    @Published var codexPreviewCount = 0
     @Published var permissionNotice = "Auto-scan uses LUB Inbox and approved watch folders only."
     private var scopedURLs: [String: URL] = [:]
     private var scopedAccess: [String: Bool] = [:]
@@ -152,6 +191,154 @@ private extension Double {
         if isOlderSelfUpdate(item) { requestLUBRollback(item) }
         else { prepareSourceSelfUpdate(from: item.path) }
     }
+    enum ReleaseState {
+        case newer, current, previouslyInstalled, older, modified, installed, available
+    }
+    private func receiptScope(project: String, target: URL) -> String {
+        project.lowercased() + "|" + target.standardizedFileURL.path
+    }
+    private func receipts(for project: Project, target: URL) -> [AppliedReceipt] {
+        receiptHistory[receiptScope(project: project.id, target: target)] ?? []
+    }
+    // A previous release can only undo the most recent installation, never an arbitrary
+    // historical ZIP. Its backup must be complete before the Roll Back action is enabled.
+    func projectRollbackBackup(for item: Candidate) -> URL? {
+        guard !item.isSelfUpdate,
+              let project = projects.first(where: { $0.directory.standardizedFileURL == item.projectPath?.standardizedFileURL }) else { return nil }
+        let target = installDestination(for: project)
+        let history = receipts(for: project, target: target)
+        guard history.count >= 2, history[0].version != history[1].version,
+              LUBVersionPolicy.compare(history[1].version, item.manifest.version) == .orderedSame,
+              let data = try? Data(contentsOf: history[0].backup.appendingPathComponent("restore.json")),
+              let record = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              record["completed"] as? Bool == true, record["rolledBack"] as? Bool != true,
+              record["target"] as? String == target.path,
+              let paths = record["files"] as? [String], !paths.isEmpty else { return nil }
+        let originalPresence = record["originalPresence"] as? [String: Bool] ?? [:]
+        for path in paths {
+            guard safeRelative(path), originalPresence[path] != nil else { return nil }
+            let destination = target.appendingPathComponent(path)
+            let parent = destination.deletingLastPathComponent().resolvingSymlinksInPath()
+            let canonical = target.resolvingSymlinksInPath()
+            guard parent.path == canonical.path || parent.path.hasPrefix(canonical.path + "/") else { return nil }
+            if originalPresence[path] == true && !fm.fileExists(atPath: history[0].backup.appendingPathComponent(path).path) {
+                return nil
+            }
+        }
+        return history[0].backup
+    }
+    @Published var pendingProjectRollback: Candidate? = nil
+    func requestProjectRollback(_ item: Candidate) {
+        guard projectRollbackBackup(for: item) != nil else {
+            announce("Rollback unavailable: no verified backup of the immediately preceding installation.")
+            return
+        }
+        pendingProjectRollback = item
+    }
+    func confirmProjectRollback() {
+        guard let item = pendingProjectRollback else { return }
+        pendingProjectRollback = nil
+        guard let backup = projectRollbackBackup(for: item) else {
+            announce("Rollback no longer available; backup verification changed.")
+            return
+        }
+        lastBackup = backup
+        rollback()
+    }
+    // Persist the highest observed release by *logical project identity*, not just
+    // by directory. Older builds used path-scoped keys; preserve that knowledge
+    // when a project is moved or a source ZIP was first discovered unmatched.
+    private func highestKnownVersion(for name: String) -> String? {
+        let prefix = name.lowercased() + "|"
+        let versions = highestObservedVersions.compactMap { key, value -> String? in
+            (key == name.lowercased() || key.hasPrefix(prefix)) ? value : nil
+        }
+        return versions.max { LUBVersionPolicy.compare($0, $1) == .orderedAscending }
+    }
+    private func metadataVersion(for project: Project) -> String? {
+        // A project's own MARKETING_VERSION helps recognize old packages. We do not use
+        // it alone to call a package new, since patch and app versions may differ.
+        let pbxproj = project.xcodeproj.appendingPathComponent("project.pbxproj")
+        guard let text = try? String(contentsOf: pbxproj, encoding: .utf8),
+              let regex = try? NSRegularExpression(pattern: #"MARKETING_VERSION\s*=\s*\"?([0-9]+(?:\.[0-9]+)+)\"?\s*;"#),
+              let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              let range = Range(match.range(at: 1), in: text) else { return nil }
+        return String(text[range])
+    }
+    func releaseState(_ item: Candidate) -> ReleaseState {
+        if item.isSelfUpdate {
+            let comparison = LUBVersionPolicy.compare(item.manifest.version, runningLUBVersion)
+            if comparison == .orderedDescending { return .newer }
+            if comparison == .orderedSame { return .current }
+            return canRollbackLUB(item) ? .previouslyInstalled : .older
+        }
+        let project = projects.first(where: { $0.directory.standardizedFileURL == item.projectPath?.standardizedFileURL })
+        let target = project.map { installDestination(for: $0) }
+        let history = (project != nil && target != nil) ? receipts(for: project!, target: target!) : []
+        let active = history.first
+        let groupKey = item.manifest.project.lowercased() + "|" + (target?.standardizedFileURL.path ?? "unmatched")
+        var knownVersions = candidates.filter {
+            !$0.isSelfUpdate && $0.manifest.project.caseInsensitiveCompare(item.manifest.project) == .orderedSame &&
+            (project == nil || $0.projectPath?.standardizedFileURL == project?.directory.standardizedFileURL)
+        }.map { $0.manifest.version }
+        knownVersions += history.map { $0.version }
+        if let observed = highestObservedVersions[groupKey] { knownVersions.append(observed) }
+        if let observed = highestKnownVersion(for: item.manifest.project) { knownVersions.append(observed) }
+        if let project, let metadata = metadataVersion(for: project),
+           LUBVersionPolicy.compare(item.manifest.version, metadata) == .orderedAscending {
+            knownVersions.append(metadata)
+        }
+        let matchesActive = active.map { LUBVersionPolicy.compare($0.version, item.manifest.version) == .orderedSame } ?? false
+        var changed = false
+        if matchesActive, let target {
+            changed = item.manifest.files.contains { file in
+                let location = target.appendingPathComponent(file.destination)
+                guard let data = try? Data(contentsOf: location) else { return true }
+                let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+                return digest.caseInsensitiveCompare(file.sha256) != .orderedSame
+            }
+        }
+        switch LUBVersionPolicy.decide(package: item.manifest.version, installed: active?.version,
+                                       knownVersions: knownVersions, matchesActiveReceipt: matchesActive,
+                                       activeFilesChanged: changed) {
+        case .newer: return .newer
+        case .current: return .installed
+        case .old: return .older
+        case .available: return .available
+        case .modified: return .modified
+        }
+    }
+    func releaseLabel(_ item: Candidate) -> String {
+        switch releaseState(item) {
+        case .newer: return "New Version Available"
+        case .current: return "Current Version"
+        case .previouslyInstalled, .older: return "Old Version"
+        case .modified: return "Modified Build"
+        case .installed: return "Installed"
+        case .available: return "Available"
+        }
+    }
+    func isMutedRelease(_ item: Candidate) -> Bool {
+        switch releaseState(item) {
+        case .current, .previouslyInstalled, .older, .modified, .installed: return true
+        default: return false
+        }
+    }
+    func requestVersionAction(_ item: Candidate) {
+        if item.isSelfUpdate {
+            if canRollbackLUB(item) { requestLUBRollback(item) }
+            else if isOlderSelfUpdate(item) { announce("No verified rollback backup. An older release needs explicit installation support.") }
+            else { requestSelfUpdate(item) }
+            return
+        }
+        if releaseState(item) == .older {
+            if projectRollbackBackup(for: item) != nil { requestProjectRollback(item) }
+            else { announce("Old Version — no verified previous-installation backup. Installation is not an automatic rollback.") }
+            return
+        }
+        // Project updates always require the standard approval dialog.
+        request(item)
+    }
     func isInstalled(_ item: Candidate) -> Bool {
         if item.isSelfUpdate {
             return item.manifest.version.compare(runningLUBVersion, options: .numeric) == .orderedSame
@@ -161,8 +348,19 @@ private extension Double {
     }
     func reloadInstalledHistory() {
         var discovered = Set<String>()
-        let directory = bridgeRoot.appendingPathComponent("Backups")
-        if let projectDirs = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) {
+        var history: [String: [AppliedReceipt]] = [:]
+        // Modern LUB stores receipts in Application Support. Older LUB releases
+        // stored them beside the Xcode source under Update Bridge/Backups.
+        // Both are read-only history sources. Never scan arbitrary private folders.
+        let historyRoots = [
+            bridgeRoot.appendingPathComponent("Backups", isDirectory: true),
+            root.appendingPathComponent("Update Bridge/Backups", isDirectory: true),
+            root.appendingPathComponent("Backups", isDirectory: true)
+        ]
+        var seenHistory = Set<String>()
+        for directory in historyRoots where fm.isReadableFile(atPath: directory.path) {
+            if !seenHistory.insert(directory.standardizedFileURL.path).inserted { continue }
+            guard let projectDirs = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else { continue }
             for projectDir in projectDirs {
                 guard let updates = try? fm.contentsOfDirectory(at: projectDir, includingPropertiesForKeys: nil) else { continue }
                 for update in updates {
@@ -173,11 +371,20 @@ private extension Double {
                           let name = record["project"] as? String,
                           let version = record["version"] as? String,
                           let target = record["target"] as? String else { continue }
-                    discovered.insert(installedKey(project: name, version: version, target: URL(fileURLWithPath: target)))
+                    let targetURL = URL(fileURLWithPath: target)
+                    discovered.insert(installedKey(project: name, version: version, target: targetURL))
+                    let createdText = record["created"] as? String ?? ""
+                    let created = ISO8601DateFormatter().date(from: createdText) ??
+                        ((try? update.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast)
+                    let key = receiptScope(project: name, target: targetURL)
+                    history[key, default: []].append(AppliedReceipt(version: version, backup: update, created: created))
                 }
             }
         }
         installedKeys = discovered
+        receiptHistory = history.mapValues { rows in
+            rows.sorted { left, right in left.created == right.created ? left.backup.path > right.backup.path : left.created > right.created }
+        }
     }
     // Store user-selected folder bookmarks, rather than repeatedly walking protected folders.
     func rememberAccess(_ url: URL) {
@@ -391,9 +598,15 @@ private extension Double {
     }
     var visibleCandidates: [Candidate] {
         let base = candidates.filter { candidate in
-            // Keep the currently installed LUB release visible even with latest-only enabled.
-            if candidate.isSelfUpdate && isCurrentSelfUpdate(candidate) { return true }
+            // All historical versions are shown by default. When the user explicitly
+            // hides older versions, retain only the active installation and newest
+            // available release; old install receipts do not override this filter.
             guard latestOnly else { return true }
+            if candidate.isSelfUpdate && isCurrentSelfUpdate(candidate) { return true }
+            if !candidate.isSelfUpdate {
+                let state = releaseState(candidate)
+                if state == .installed || state == .modified { return true }
+            }
             return !candidates.contains { other in
                 other.isSelfUpdate == candidate.isSelfUpdate &&
                 other.manifest.project.caseInsensitiveCompare(candidate.manifest.project) == .orderedSame &&
@@ -468,6 +681,18 @@ private extension Double {
             return fm.isReadableFile(atPath: folder.path) ? folder : nil
         }
         for folder in scanRoots { packageURLs += scanDirectory(folder, depth: 1) }
+        // User-scoped Codex previews live in macOS's private /var/folders temp tree.
+        // Do not enumerate unrelated users or protected folders. Enabling this is opt-in.
+        if scanCodexPreviews {
+            let userTemp = fm.temporaryDirectory.resolvingSymlinksInPath()
+            let previewRoots = [userTemp,
+                                userTemp.deletingLastPathComponent().appendingPathComponent("C")]
+            let discovered = previewRoots.flatMap { scanPreviewTree($0, depth: 3) }
+            codexPreviewCount = discovered.count
+            packageURLs += discovered
+        } else {
+            codexPreviewCount = 0
+        }
         if !fm.isReadableFile(atPath: root.path) {
             permissionNotice = "Projects folder is unavailable. Choose Projects Folder to grant access again; imported ZIPs remain available in the LUB Inbox."
         }
@@ -496,6 +721,16 @@ private extension Double {
             return a > b
         }
         reloadInstalledHistory()
+        for item in accepted where !item.isSelfUpdate {
+            let logical = item.manifest.project.lowercased()
+            let scope = logical + "|" + (item.projectPath?.standardizedFileURL.path ?? "unmatched")
+            for key in [logical, scope] {
+                if let previous = highestObservedVersions[key],
+                   LUBVersionPolicy.compare(item.manifest.version, previous) != .orderedDescending { continue }
+                highestObservedVersions[key] = item.manifest.version
+            }
+        }
+        UserDefaults.standard.set(highestObservedVersions, forKey: "lub.highestObservedVersions")
         lastScanDate = Date()
     }
     private func scanDirectory(_ dir: URL, depth: Int) -> [URL] {
@@ -511,12 +746,18 @@ private extension Double {
         return result
     }
     private func scanPreviewTree(_ dir: URL, depth: Int) -> [URL] {
-        guard depth >= 0, let entries = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else { return [] }
+        guard depth >= 0,
+              let entries = try? fm.contentsOfDirectory(at: dir,
+                                                         includingPropertiesForKeys: [.isDirectoryKey],
+                                                         options: [.skipsHiddenFiles]) else { return [] }
         var result: [URL] = []
-        for url in entries {
+        // Traverse only modest-size directory listings so background scans stay responsive.
+        for url in entries.prefix(250) {
             let name = url.lastPathComponent
-            if name.hasPrefix("codex-file-preview-") { result += scanDirectory(url, depth: 3) }
-            else if depth > 0, (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+            guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
+            if name.hasPrefix("codex-file-preview-") {
+                result += scanDirectory(url, depth: 3)
+            } else if depth > 0 && (name == "T" || name == "C" || name.hasPrefix("codex-")) {
                 result += scanPreviewTree(url, depth: depth - 1)
             }
         }
@@ -577,7 +818,7 @@ private extension Double {
     func openUpdate(_ item: Candidate) {
         guard !busy else { return }
         if item.isSelfUpdate { requestSelfUpdate(item); return }
-        guard !isInstalled(item) else { return }
+        guard !busy else { return }
         if item.projectPath != nil { request(item) }
     }
     func request(_ item: Candidate) { approvedCandidate = item }
@@ -756,8 +997,7 @@ private extension Double {
             let outputDir = chosenDMGURL.deletingLastPathComponent()
             let logFile = logDirectory.appendingPathComponent("\(project.id)-dmg-\(Int(Date().timeIntervalSince1970)).log")
             var fullLog = ""
-            defer { try? fm.removeItem(at: session) }
-            do {
+            defer { try? fm.removeItem(at: session) }            do {
                 try fm.createDirectory(at: derived, withIntermediateDirectories: true)
                 try fm.createDirectory(at: stage, withIntermediateDirectories: true)
                 try fm.createDirectory(at: outputDir, withIntermediateDirectories: true)
@@ -983,8 +1223,9 @@ struct BridgeView: View {
                 Picker("Sort", selection: $bridge.updateSort) {
                     ForEach(UpdateSort.allCases) { sort in Text(sort.rawValue).tag(sort) }
                 }.frame(width: 165)
-                Toggle("Latest only", isOn: $bridge.latestOnly).toggleStyle(.checkbox)
-                    .frame(width: 120, alignment: .trailing)
+                Toggle("Hide old versions", isOn: $bridge.latestOnly).toggleStyle(.checkbox)
+                    .frame(width: 175, alignment: .trailing)
+                    .help("Off by default: show older releases and their rollback availability")
             }
             if bridge.visibleCandidates.isEmpty {
                 Text("No matching manifest-enabled updates found. Use Add Scan Location to watch another folder.")
@@ -1000,53 +1241,48 @@ struct BridgeView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .layoutPriority(-1)
                         Spacer(minLength: 8)
+                        let state = bridge.releaseState(candidate)
+                        Text(bridge.releaseLabel(candidate))
+                            .font(.system(size: 12 * bridge.textScale, weight: .semibold))
+                            .foregroundStyle(state == .newer ? Color.green : Color.secondary)
+                            .padding(.horizontal, 9).padding(.vertical, 4)
+                            .background(Color.gray.opacity(0.14), in: Capsule())
                         if candidate.isSelfUpdate {
-                            if bridge.isCurrentSelfUpdate(candidate) {
-                                Text("Current Version")
-                                    .font(.system(size: 12 * bridge.textScale, weight: .semibold))
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 9).padding(.vertical, 4)
-                                    .background(.gray.opacity(0.14), in: Capsule())
-                                Button("Reapply Update") { bridge.requestSelfUpdate(candidate) }
-                                    .disabled(bridge.busy)
-                                    .help("Rebuild and reinstall the same LUB version after confirmation")
-                            } else if bridge.isOlderSelfUpdate(candidate) {
-                                Text(bridge.canRollbackLUB(candidate) ? "Previously installed" : "Older version")
-                                    .font(.system(size: 12 * bridge.textScale, weight: .semibold))
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 9).padding(.vertical, 4)
-                                    .background(.gray.opacity(0.14), in: Capsule())
-                                if bridge.canRollbackLUB(candidate) {
-                                    Button("Roll Back…") { bridge.requestLUBRollback(candidate) }
-                                        .disabled(bridge.busy)
-                                }
-                            } else {
-                                Button("Update LUB") { bridge.requestSelfUpdate(candidate) }
-                                    .disabled(bridge.busy)
+                            if state == .current {
+                                Button("Reapply Update") { bridge.requestVersionAction(candidate) }.disabled(bridge.busy)
+                            } else if state == .previouslyInstalled {
+                                Button("Roll Back…") { bridge.requestVersionAction(candidate) }.disabled(bridge.busy)
+                            } else if state == .newer {
+                                Button("Install Update") { bridge.requestVersionAction(candidate) }.disabled(bridge.busy)
+                            } else if state == .older {
+                                Button("Backup Unavailable") { bridge.requestVersionAction(candidate) }.disabled(true)
                             }
                         } else {
-                            if bridge.isInstalled(candidate) {
-                                Text("Installed")
-                                    .font(.system(size: 12 * bridge.textScale, weight: .semibold))
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 9).padding(.vertical, 4)
-                                    .background(.gray.opacity(0.14), in: Capsule())
-                            }
                             if candidate.projectPath == nil {
-                                Button("Detect Project") { bridge.detectProject(for: candidate) }
-                                    .disabled(bridge.busy)
+                                Button("Detect Project") { bridge.detectProject(for: candidate) }.disabled(bridge.busy)
+                            } else {
+                                switch state {
+                                case .installed:
+                                    Button("Reinstall") { bridge.requestVersionAction(candidate) }.disabled(bridge.busy)
+                                case .modified:
+                                    Button("Review & Reinstall") { bridge.requestVersionAction(candidate) }.disabled(bridge.busy)
+                                case .older:
+                                    if bridge.projectRollbackBackup(for: candidate) != nil {
+                                        Button("Roll Back…") { bridge.requestVersionAction(candidate) }.disabled(bridge.busy)
+                                    } else {
+                                        Text("Backup Unavailable").font(.caption).foregroundStyle(.secondary)
+                                    }
+                                default:
+                                    Button("Install Update") { bridge.requestVersionAction(candidate) }.disabled(bridge.busy)
+                                }
                             }
-                        }
-                        if !candidate.isSelfUpdate {
-                            Button("Review") { bridge.request(candidate) }
-                                .disabled(candidate.projectPath == nil || bridge.busy || bridge.isInstalled(candidate))
                         }
                     }
                     .contentShape(Rectangle())
-                    .onTapGesture(count: 2) { bridge.openUpdate(candidate) }
+                    .onTapGesture(count: 2) { bridge.requestVersionAction(candidate) }
                     .help(candidate.isSelfUpdate && bridge.isCurrentSelfUpdate(candidate) ? "Double-click to reapply this release after confirmation" : (candidate.isSelfUpdate && bridge.isOlderSelfUpdate(candidate) ? "Double-click to offer rollback when a verified backup exists" : "Double-click to review and install this update"))
                     .frame(minHeight: 48)
-                    .opacity((bridge.isInstalled(candidate) || bridge.isOlderSelfUpdate(candidate)) ? 0.60 : 1)
+                    .opacity(bridge.isMutedRelease(candidate) ? 0.60 : 1)
                 }.frame(height: 230)
             }
             VStack(alignment: .leading, spacing: 3) {
@@ -1135,6 +1371,22 @@ struct BridgeView: View {
                 }
                 Button("Scan Now") { bridge.refresh() }.disabled(bridge.busy)
             }
+            HStack {
+                Toggle("Scan ChatGPT Codex previews", isOn: $bridge.scanCodexPreviews)
+                    .toggleStyle(.checkbox)
+                    .help("Read-only scan of this Mac user's codex-file-preview-* temporary folders. Does not request Full Disk Access.")
+                Spacer()
+                if bridge.scanCodexPreviews {
+                    Text("Found \(bridge.codexPreviewCount) package paths")
+                        .foregroundStyle(.secondary)
+                }
+                Button("Choose Codex Folder…") {
+                    chooseFolder { bridge.addScanFolder($0.path) }
+                }.help("For a Codex preview path outside your Mac user temporary folder, approve its enclosing directory once")
+            }
+            Text("Codex temporary previews may disappear automatically. Updates found there are read-only until you approve installation.")
+                .font(.system(size: 11 * bridge.textScale))
+                .foregroundStyle(.secondary)
             if !bridge.permissionNotice.isEmpty {
                 Text(bridge.permissionNotice).font(.system(size: 11 * bridge.textScale)).foregroundStyle(.secondary)
             }
@@ -1211,6 +1463,12 @@ struct BridgeView: View {
             Button("Back Up, Replace and Restart") { bridge.installSelfUpdate() }
         } message: {
             Text("LUB will quit, back up the installed app, verify and replace it, then relaunch. Only use a trusted build. If replacement fails, the helper restores the previous application.")
+        }
+        .alert("Revert last project installation?", isPresented: Binding(get: { bridge.pendingProjectRollback != nil }, set: { if !$0 { bridge.pendingProjectRollback = nil } })) {
+            Button("Cancel", role: .cancel) { bridge.pendingProjectRollback = nil }
+            Button("Restore Previous Installation") { bridge.confirmProjectRollback() }
+        } message: {
+            Text("Restore the files from the verified backup of the most recent project update. This reverts only that update's changed files, not the entire project. Continue only if you intend to undo those changes.")
         }
         .alert("Review project update", isPresented: Binding(get: { bridge.approvedCandidate != nil }, set: { if !$0 { bridge.approvedCandidate = nil } })) {
             Button("Cancel", role: .cancel) { bridge.approvedCandidate = nil }

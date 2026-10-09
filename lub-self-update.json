@@ -2,6 +2,6 @@
   "formatVersion": 1,
   "kind": "lub-source-release",
   "bundleID": "org.lub.LocalUpdateBridge",
-  "version": "1.6.9.7",
-  "build": 1697
+  "version": "1.6.9.12",
+  "build": 16912
 }
