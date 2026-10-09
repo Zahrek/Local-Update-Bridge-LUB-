@@ -997,7 +997,8 @@ struct LUBVersionPolicy {
             let outputDir = chosenDMGURL.deletingLastPathComponent()
             let logFile = logDirectory.appendingPathComponent("\(project.id)-dmg-\(Int(Date().timeIntervalSince1970)).log")
             var fullLog = ""
-            defer { try? fm.removeItem(at: session) }            do {
+            defer { try? fm.removeItem(at: session) }
+            do {
                 try fm.createDirectory(at: derived, withIntermediateDirectories: true)
                 try fm.createDirectory(at: stage, withIntermediateDirectories: true)
                 try fm.createDirectory(at: outputDir, withIntermediateDirectories: true)
