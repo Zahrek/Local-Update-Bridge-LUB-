@@ -30,7 +30,7 @@ if [[ "$IDENTITY" != '-' ]]; then
 fi
 VERSION=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$APP/Contents/Info.plist")
 DMG="$ROOT/releases/Local-Update-Bridge-v$VERSION.dmg"
-"$ROOT/scripts/create-dmg.sh" "$APP" "$DMG"
+bash "$ROOT/scripts/create-dmg.sh" "$APP" "$DMG"
 if [[ -n "${LUB_NOTARY_PROFILE:-}" ]]; then
   if [[ "$IDENTITY" == '-' ]]; then echo 'ERROR: Notarization requires Developer ID signing.' >&2; exit 1; fi
   NOTARY_ARGS=(--keychain-profile "$LUB_NOTARY_PROFILE")
