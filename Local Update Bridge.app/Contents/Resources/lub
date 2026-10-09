@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""LUB CLI alpha: stdlib-only deterministic v1 package operations.
+Use --json for machine-readable output. Mutations require --approve.
+"""
+import argparse, hashlib, json, os, pathlib, shutil, subprocess, sys, tempfile, time, zipfile, re
+
+class LUBError(Exception): pass
+
+def fail(message): raise LUBError(message)
+def under(root, rel):
+    if not isinstance(rel,str) or not rel or '\\' in rel or rel.startswith('/') or any(x in ('', '.', '..') for x in rel.split('/')): fail('Unsafe relative path: '+str(rel))
+    root=root.resolve(); p=root.joinpath(rel)
+    if not p.resolve().is_relative_to(root): fail('Path escapes root: '+rel)
+    return p
+
+def load_package(package):
+    p=pathlib.Path(package).expanduser().resolve()
+    if not p.exists(): fail('Package does not exist')
+    if p.is_dir():
+        m=json.loads((p/'bridge-manifest.json').read_text())
+        def reader(rel): return under(p,rel).read_bytes()
+    elif zipfile.is_zipfile(p):
+        z=zipfile.ZipFile(p)
+        if len(z.infolist()) > 2000: fail('Too many ZIP entries')
+        if sum(i.file_size for i in z.infolist()) > 100_000_000: fail('ZIP uncompressed size limit exceeded')
+        for i in z.infolist():
+            name=i.filename.rstrip('/')
+            if name: under(pathlib.Path('/tmp/lub-zip-root'),name)
+            if (i.external_attr >> 16) & 0o170000 == 0o120000: fail('Symlink ZIP entries not allowed')
+        m=json.loads(z.read('bridge-manifest.json'))
+        def reader(rel): return z.read(rel)
+    else: fail('Package must be a directory or zip')
+    if m.get('formatVersion') != 1: fail('Unsupported manifest formatVersion (expected 1)')
+    if not isinstance(m.get('project'),str) or not m['project']: fail('Missing project name')
+    if not isinstance(m.get('files'),list) or not m['files']: fail('No files in manifest')
+    if len(m['files']) > 1000: fail('Too many manifest entries (limit: 1000)')
+    payload=[]; destinations=set()
+    for item in m['files']:
+        src=item.get('source'); dst=item.get('destination'); h=item.get('sha256','')
+        if not isinstance(src,str) or not src.startswith('payload/'): fail('Source must be inside payload/')
+        if not isinstance(dst,str): fail('Invalid destination path')
+        if not re.fullmatch(r'[0-9a-fA-F]{64}',str(h)): fail('Invalid SHA256: '+src)
+        under(pathlib.Path('/tmp/lub-source-root'),src); under(pathlib.Path('/tmp/lub-target-root'),dst)
+        if dst in destinations: fail('Repeated destination: '+dst)
+        destinations.add(dst)
+        data=reader(src)
+        if len(data)>20_000_000: fail('Payload exceeds 20 MB limit: '+src)
+        if hashlib.sha256(data).hexdigest().lower()!=str(h).lower(): fail('SHA256 mismatch: '+src)
+        payload.append((dst,data))
+    return m,payload
+
+def report(args,command,**kw):
+    obj={'ok':True,'command':command,**kw}
+    if args.json: print(json.dumps(obj,indent=2))
+    else: print(json.dumps(obj,indent=2))
+
+def main():
+    ap=argparse.ArgumentParser(prog='lub',description='Local Update Bridge CLI alpha')
+    ap.add_argument('--json',action='store_true')
+    ap.add_argument('--version',action='version',version='LUB CLI 1.2.0 (protocol 1)')
+    sub=ap.add_subparsers(dest='command',required=True)
+    for name in ('validate','preview','apply'):
+        p=sub.add_parser(name); p.add_argument('package'); p.add_argument('--project',required=True); p.add_argument('--approve',action='store_true')
+    for name in ('build','test'):
+        p=sub.add_parser(name); p.add_argument('--project',required=True); p.add_argument('--exec',nargs=argparse.REMAINDER,required=True)
+    for name in ('status','history','rollback'):
+        p=sub.add_parser(name); p.add_argument('--project',required=True)
+        if name=='rollback': p.add_argument('--approve',action='store_true')
+    p=sub.add_parser('diagnose'); p.add_argument('log')
+    a=ap.parse_args()
+    try:
+        if a.command in ('validate','preview','apply'):
+            m,payload=load_package(a.package)
+            project=pathlib.Path(a.project).expanduser().resolve(strict=True)
+            if not project.is_dir(): fail('Project is not a directory')
+            if project.is_symlink(): fail('Project root cannot be a symbolic link')
+            if project.name.casefold()!=m['project'].casefold(): fail('Manifest project does not match directory name')
+            files=[]
+            for dst,data in payload:
+                out=under(project,dst)
+                if out.exists() and (not out.is_file() or out.is_symlink()): fail('Destination is not a regular file: '+dst)
+                if not out.parent.resolve().is_relative_to(project): fail('Destination parent escapes project: '+dst)
+                before=out.read_bytes() if out.exists() else None
+                files.append({'path':dst,'action':'create' if before is None else 'unchanged' if before==data else 'replace','bytes':len(data)})
+            if a.command!='apply': return report(a,a.command,project=m['project'],version=m.get('version'),files=files)
+            if not a.approve: fail('Explicit --approve required for apply')
+            # Backup is outside project, keyed to canonical path to prevent same-name collisions.
+            key=hashlib.sha256(str(project).encode()).hexdigest()[:16]
+            backup=pathlib.Path.home()/'.local/share/lub/backups'/key/(str(int(time.time()))+'-'+os.urandom(4).hex())
+            backup.mkdir(parents=True)
+            # Ensure no file has been changed by another process since preview.
+            restore={'project':str(project),'manifest':m,'files':[],'completed':False}
+            # Snapshot every existing file BEFORE modifying any target.
+            for dst,data in payload:
+                out=under(project,dst); present=out.exists()
+                if present:
+                    saved=under(backup,'original/'+dst); saved.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(out,saved)
+                restore['files'].append({'path':dst,'existed':present})
+            atomic_json(backup/'restore.json',restore)
+            try:
+                for dst,data in payload:
+                    out=under(project,dst)
+                    out.parent.mkdir(parents=True,exist_ok=True)
+                    # Check again after creating parent directories (symlink race minimized, not eliminated).
+                    under(project,dst)
+                    fd,tmp=tempfile.mkstemp(prefix='.lub-',dir=out.parent)
+                    try:
+                        with os.fdopen(fd,'wb') as stream: stream.write(data)
+                        os.replace(tmp,out)
+                    finally:
+                        if os.path.exists(tmp): os.unlink(tmp)
+                restore['completed']=True
+                atomic_json(backup/'restore.json',restore)
+            except Exception:
+                restore_files(backup,restore,project)
+                raise
+            return report(a,'apply',project=str(project),version=m.get('version'),backup=str(backup),files=files)
+        project=pathlib.Path(getattr(a,'project','.')).expanduser().resolve()
+        key=hashlib.sha256(str(project).encode()).hexdigest()[:16]
+        backups=pathlib.Path.home()/'.local/share/lub/backups'/key
+        history=sorted((d for d in backups.iterdir() if (d/'restore.json').exists()),reverse=True) if backups.exists() else []
+        if a.command in ('history','status'): return report(a,a.command,project=str(project),backups=[str(x) for x in history],latest=str(history[0]) if history else None)
+        if a.command=='rollback':
+            if not a.approve: fail('Explicit --approve required for rollback')
+            if not history: fail('No recorded backup')
+            record=json.loads((history[0]/'restore.json').read_text())
+            if not record.get('completed'): fail('Latest snapshot is incomplete; manual recovery review required: '+str(history[0]))
+            if record.get('project')!=str(project): fail('Backup belongs to another project')
+            restore_files(history[0],record,project)
+            # Move restored backup out of active history so a second rollback moves to previous version.
+            restored_location=history[0].with_name('restored-'+history[0].name)
+            history[0].rename(restored_location)
+            return report(a,'rollback',restored=str(restored_location))
+        if a.command in ('build','test'):
+            if not project.is_dir(): fail('Project missing')
+            if not a.exec: fail('Provide --exec executable arguments')
+            result=subprocess.run(a.exec,cwd=project,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+            logdir=pathlib.Path.home()/'.local/share/lub/logs'; logdir.mkdir(parents=True,exist_ok=True)
+            logfile=logdir/(str(int(time.time()))+'-'+a.command+'.log'); logfile.write_text(result.stdout)
+            issues=[line.strip() for line in result.stdout.splitlines() if 'error:' in line.lower() or 'warning:' in line.lower()]
+            report(a,a.command,exitCode=result.returncode,success=result.returncode==0,log=str(logfile),issues=issues[:100])
+            return 0 if result.returncode==0 else 1
+        if a.command=='diagnose':
+            lines=pathlib.Path(a.log).read_text(errors='replace').splitlines()
+            found=[x.strip() for x in lines if 'error:' in x.lower() or 'warning:' in x.lower()]
+            return report(a,'diagnose',issues=found[:100],issueCount=len(found))
+    except (LUBError,OSError,ValueError,KeyError,TypeError,zipfile.BadZipFile) as e:
+        output={'ok':False,'error':str(e)}
+        print(json.dumps(output) if a.json else 'ERROR: '+str(e),file=sys.stderr)
+        return 1
+
+def atomic_json(path, value):
+    fd,tmp=tempfile.mkstemp(prefix='.lub-record-',dir=path.parent)
+    try:
+        with os.fdopen(fd,'w',encoding='utf8') as stream:
+            json.dump(value,stream,indent=2)
+            stream.flush(); os.fsync(stream.fileno())
+        os.replace(tmp,path)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+
+def restore_files(backup,record,project):
+    # Verify all paths before rollback.
+    for item in record['files']:
+        dst=under(project,item['path'])
+        if item['existed']:
+            src=under(backup,'original/'+item['path'])
+            if not src.is_file(): fail('Missing backed-up file: '+item['path'])
+        if dst.is_symlink(): fail('Cannot restore over symbolic link: '+item['path'])
+        if dst.exists() and not dst.is_file(): fail('Cannot restore over non-file: '+item['path'])
+    for item in reversed(record['files']):
+        dst=under(project,item['path'])
+        if item['existed']:
+            dst.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(under(backup,'original/'+item['path']),dst)
+        else: dst.unlink(missing_ok=True)
+
+if __name__=='__main__': sys.exit(main() or 0)

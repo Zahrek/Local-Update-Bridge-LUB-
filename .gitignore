@@ -1,0 +1,13 @@
+.DS_Store
+.build/
+DerivedData/
+build/
+dist/
+releases/
+*.xcuserstate
+xcuserdata/
+__pycache__/
+*.pyc
+Logs/
+Backups/
+Staging/
