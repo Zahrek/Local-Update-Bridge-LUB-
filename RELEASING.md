@@ -31,3 +31,9 @@ iOS-only schemes, schemes producing no app, or schemes producing multiple apps.
 It requires Xcode and its command-line tools on the Mac. Logs are saved under
 LUB's Application Support `Logs` folder. The DMG is a local/testing package:
 public Gatekeeper-friendly distribution requires Developer ID signing and notarization.
+
+## CI storage and compute limits
+
+Temporary workflow installers are retained for **7 days**, and failed-build diagnostic logs for **3 days**. Download a test installer within that period if it is needed for review. Published signed GitHub Releases keep their existing lifecycle; this change does not delete releases, old artifacts or backups.
+
+Feature branches run through the pull-request event, while `main` and version tags keep their existing push checks. A new commit cancels superseded PR tests, but does not interrupt an in-progress tag release. Jobs have a 45-minute timeout. While the hosted allowance is exhausted, use local validation rather than increasing spending automatically.
